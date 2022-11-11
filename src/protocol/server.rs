@@ -1,3 +1,5 @@
+use crate::protocol::RequestTarget;
+use crate::runtime::container::{AddError, ConnectError};
 use bytes::{Buf, BytesMut};
 use std::io::{Cursor, ErrorKind};
 use std::str::from_utf8;
@@ -17,15 +19,19 @@ impl Server {
         Ok(Self { listener })
     }
 
-    pub async fn run(self) -> io::Result<()> {
+    pub async fn run<T>(self, target: T) -> io::Result<()>
+    where
+        T: RequestTarget + 'static,
+    {
         loop {
             let (stream, addr) = self.listener.accept().await?;
             log::info!("New connection: {addr}");
 
             let connection = Connection::new(stream);
 
+            let target = target.clone();
             tokio::spawn(async {
-                match connection.run().await {
+                match connection.run(target).await {
                     Ok(_) => log::info!("Connection closed"),
                     Err(err) => log::warn!("Connection closed: {err}"),
                 }
@@ -46,8 +52,8 @@ pub struct Request {
     id: String,
     #[serde(rename = "Action")]
     action: Action,
-    #[serde(rename = "$value")]
-    data: Data,
+    #[serde(default, rename = "$value")]
+    data: Option<Data>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -74,6 +80,20 @@ pub enum Data {
         r#type: String,
     },
     Watches,
+    #[serde(rename_all = "PascalCase")]
+    Connection {
+        source: String,
+        destination: String,
+    },
+    #[serde(rename = "FBList")]
+    FunctionBlockList(Vec<FunctionBlock>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename = "FB")]
+pub struct FunctionBlock {
+    pub name: String,
+    pub r#type: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,6 +141,23 @@ pub enum Error {
     Unknown,
 }
 
+impl From<AddError> for Error {
+    fn from(err: AddError) -> Self {
+        match err {
+            AddError::UnknownType => Error::UnsupportedType,
+            AddError::ItemAlreadyExist => Error::DuplicateObject,
+        }
+    }
+}
+
+impl From<ConnectError> for Error {
+    fn from(err: ConnectError) -> Self {
+        match err {
+            ConnectError::UnknownBlock | ConnectError::UnknownPort => Error::InvalidDestination,
+        }
+    }
+}
+
 struct Connection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
@@ -134,13 +171,16 @@ impl Connection {
         }
     }
 
-    async fn run(mut self) -> io::Result<()> {
+    async fn run<T>(mut self, target: T) -> io::Result<()>
+    where
+        T: RequestTarget,
+    {
         loop {
             let req = self.read_request().await?;
             match req {
                 Some(req) => {
                     log::info!("Request: {req:?}");
-                    match self
+                    match target
                         .process_request(req.dest, req.request.action, req.request.data)
                         .await
                     {
@@ -170,24 +210,9 @@ impl Connection {
         }
     }
 
-    async fn process_request(
-        &mut self,
-        destination: String,
-        action: Action,
-        data: Data,
-    ) -> Result<Option<Data>, Error> {
-        if !destination.is_empty() {
-            return Err(Error::InvalidDestination);
-        }
-
-        Ok(match (action, data) {
-            (Action::Read, Data::Watches) => None,
-            (Action::Query, Data::FunctionBlock { .. }) => None,
-            _ => return Err(Error::InvalidOperation),
-        })
-    }
-
     async fn write_response(&mut self, response: Response) -> io::Result<()> {
+        log::info!("Sending response: {response:?}");
+
         self.stream.write_u8(TYPE_STRING).await?;
 
         let buf = quick_xml::se::to_string(&response).map_err(|err| {
@@ -247,7 +272,7 @@ impl Connection {
             None => Ok(None),
             Some(data) => {
                 let len = buf.position() as usize;
-                log::debug!("Request was {len} bytes");
+                log::debug!("Request was {len} bytes: {data}");
                 self.buffer.advance(buf.position() as usize);
                 let request = quick_xml::de::from_str(&data).map_err(|err| {
                     io::Error::new(
